@@ -1,0 +1,29 @@
+# The OpenPerps bonding-curve program: a constant-product curve that, on
+# graduation, hands its liquidity to a spot pool and pins the paired perp market's
+# oracle. Built on Pinocchio + bytemuck only (no Anchor dependency tree).
+[package]
+name = "openperps-curve"
+version = "1.0.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "openperps_curve"
+
+[dependencies]
+pinocchio = "0.8"
+bytemuck = { version = "1.23", default-features = false, features = ["derive"] }
+
+[features]
+default = []
+no-entrypoint = []
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("solana"))'] }
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+opt-level = 3
+overflow-checks = true
