@@ -19,7 +19,7 @@ use pinocchio::{
     cpi::{invoke, invoke_signed},
     instruction::{AccountMeta, Instruction, Seed, Signer},
     program_error::ProgramError,
-    pubkey::{create_program_address, Pubkey},
+    pubkey::{create_program_address, find_program_address, Pubkey},
     sysvars::{rent::Rent, Sysvar},
     ProgramResult,
 };
@@ -77,6 +77,13 @@ pub enum CurveError {
     BadAccount = 11,
     BadDiscriminator = 12,
     BadInstruction = 13,
+    /// The `mint` supplied to `Create` is not a valid, initialized SPL mint owned
+    /// by the token program (fixes LP-CREATE-MINT).
+    BadMint = 14,
+    /// The `mint` supplied to `Create` still has a live mint or freeze authority,
+    /// so the creator could dilute or freeze buyers post-launch. A fair-launch
+    /// curve requires both renounced (fixes LP-CREATE-MINT).
+    MintNotRenounced = 15,
 }
 
 impl From<CurveError> for ProgramError {
@@ -375,21 +382,43 @@ fn process_create(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) ->
 
     let mint_key: [u8; 32] = *mint.key();
 
-    // Verify both PDAs against the supplied bumps.
-    let curve_expected = create_program_address(&[CURVE_SEED, mint_key.as_ref(), &[curve_bump]], program_id)
-        .map_err(|_| CurveError::BadPda)?;
-    if *curve.key() != curve_expected {
+    // Verify both PDAs are the CANONICAL bump (fixes L3): derive the canonical
+    // (address, bump) on-chain and require the supplied bump to match, so a caller
+    // cannot stand up a shadow curve at a non-canonical bump for the same mint.
+    let (curve_canonical, curve_canon_bump) =
+        find_program_address(&[CURVE_SEED, mint_key.as_ref()], program_id);
+    if curve_bump != curve_canon_bump || *curve.key() != curve_canonical {
         return Err(CurveError::BadPda.into());
     }
-    let vault_expected = create_program_address(&[VAULT_SEED, mint_key.as_ref(), &[vault_bump]], program_id)
-        .map_err(|_| CurveError::BadPda)?;
-    if *vault.key() != vault_expected {
+    let (vault_canonical, vault_canon_bump) =
+        find_program_address(&[VAULT_SEED, mint_key.as_ref()], program_id);
+    if vault_bump != vault_canon_bump || *vault.key() != vault_canonical {
         return Err(CurveError::BadPda.into());
     }
 
     // Reject double-create: the curve account must be system-owned (fresh) here.
     if curve.data_len() != 0 {
         return Err(CurveError::AlreadyComplete.into());
+    }
+
+    // Validate the mint for a fair launch (fixes LP-CREATE-MINT): it must be a
+    // real, initialized SPL mint with NO mint authority (no post-launch dilution)
+    // and NO freeze authority (buyers cannot be frozen). SPL Mint layout: the
+    // mint_authority COption tag is bytes 0..4 and the freeze_authority tag bytes
+    // 46..50 (0 = None); is_initialized is byte 45.
+    {
+        if unsafe { mint.owner() } != &TOKEN_PROGRAM_ID {
+            return Err(CurveError::BadMint.into());
+        }
+        let mdata = mint.try_borrow_data().map_err(|_| CurveError::BadAccount)?;
+        if mdata.len() < 82 || mdata[45] != 1 {
+            return Err(CurveError::BadMint.into());
+        }
+        let mint_auth_some = (mdata[0] | mdata[1] | mdata[2] | mdata[3]) != 0;
+        let freeze_auth_some = (mdata[46] | mdata[47] | mdata[48] | mdata[49]) != 0;
+        if mint_auth_some || freeze_auth_some {
+            return Err(CurveError::MintNotRenounced.into());
+        }
     }
 
     let rent = Rent::get()?;
